@@ -1,0 +1,43 @@
+# Local demo: docker compose up -d --build
+#   adapter  -> http://localhost:${ADAPTER_PORT:-8080}  (API under /v1, docs at /docs, demo console at /demo)
+#   tms-sim  -> simulated legacy TMS over TCP, reachable only inside the compose network
+name: clf-adapter
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+services:
+  adapter:
+    <<: *hardening
+    build: { context: ., target: runtime }
+    image: clf-adapter:1.0.0
+    env_file: .env
+    environment:
+      TMS_HOST: tms-sim
+      TMS_PORT: "9100"
+      TMS_EMBEDDED_SIM: "false"
+      PORT: "8080"
+    ports: ["${ADAPTER_PORT:-8080}:8080"]
+    depends_on:
+      tms-sim: { condition: service_healthy }
+
+  tms-sim:
+    <<: *hardening
+    build: { context: ., target: runtime }
+    image: clf-adapter:1.0.0
+    command: ["python", "-m", "tms_sim"]
+    environment:  # only what the TMS needs; it never sees the API key
+      TMS_PORT: "9100"
+      TMS_TOKEN: ${TMS_TOKEN:?TMS_TOKEN must be set in .env}
+      TMS_FAULT_RATE: ${TMS_FAULT_RATE:-0}
+    expose: ["9100"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "tms_sim", "--check"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

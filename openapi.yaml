@@ -1,0 +1,655 @@
+openapi: 3.1.0
+info:
+  title: Crystal Lane Freight - Carrier Sales Adapter API
+  version: 1.2.1
+  description: |
+    Interface between the HappyRobot voice agent and Crystal Lane Freight's systems
+    (Legacy TMS over TCP, FMCSA, SMS provider).
+
+    **Key principle:** the service enforces every business and compliance rule.
+    The AI prompt is only a second layer of defence.
+
+    **Enforced call order (per X-Call-Id):**
+    verify carrier -> send OTP -> verify OTP -> search loads -> evaluate offers -> book -> handoff
+
+    **One response shape per endpoint, always HTTP 200.** HappyRobot reads every reply with an
+    LLM and turns any non-2xx reply into one opaque text, so each endpoint answers with HTTP 200
+    and exactly the same keys whether it succeeds or fails. Every reply starts with:
+    - `ok`: `true` when the request was processed, `false` when it failed.
+    - `error_code`: `null` when ok, otherwise what failed (see ErrorCode).
+    - `error_message`: `null` when ok, otherwise what went wrong, phrased so the agent can act on it.
+    - `retryable`: `true` when the same request may succeed if retried.
+
+    When `ok` is false every business field is `null` (lists are `[]`). A `null` means "unknown",
+    never "no": `authorized: null` is not a rejected carrier.
+
+    **`ok` is not "good news".** Business results such as carrier not authorized or not found,
+    wrong code, no match or load unavailable are `ok: true`, with the answer in `status`,
+    `decision` or `authorized`. `ok: false` means the request itself failed: invalid or blank
+    input, wrong call order, rate limit, or an upstream outage.
+
+    **The only non-200 reply is 401** for a missing or wrong API key, a configuration problem
+    rather than a call outcome. Unknown paths answer 404 with `{ok, error_code, error_message, retryable}`.
+
+    **Never returned or logged:** max_rate, OTP codes, full carrier phone numbers,
+    API keys, TMS credentials.
+
+    **Changes from the v1.0.0 draft:**
+    - Response envelope above; failures are HTTP 200 with `ok: false` (only 401 stays non-200).
+    - Rate limit failure `rate_limited` (60 requests/minute per call, see x-security).
+    - `round` in EvaluateOfferRequest has no upper bound: the service counts rounds itself, so a 4th
+      attempt is answered with `final_decline`.
+    - `/carriers/verify` fails with `step_out_of_order` when the call already passed OTP for a different MC.
+    - `GET /healthz` (outside /v1, unauthenticated, returns only {"status":"ok"}) is the container
+      liveness probe for Docker / Azure.
+
+servers:
+  - url: https://{host}/v1
+    variables:
+      host:
+        default: clf-adapter.example.com
+        description: Public HTTPS host where the Docker service is deployed
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: System
+  - name: Carriers
+  - name: OTP
+  - name: Loads
+  - name: Negotiation
+  - name: Handoff
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Service health check
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              example: { ok: true, error_code: null, error_message: null, retryable: false, status: ok, tms: reachable, fmcsa: reachable, version: 1.2.1 }
+        '401':
+          description: Missing or wrong API key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              example: { ok: false, error_code: unauthorized, error_message: Invalid API key, retryable: false, status: null, tms: null, fmcsa: null, version: null }
+
+  /carriers/verify:
+    post:
+      tags: [Carriers]
+      summary: Check carrier operating authority with FMCSA
+      operationId: verifyCarrier
+      description: |
+        Maps to agent action `verify_carrier`.
+        - `authorized` is true only when the carrier has ACTIVE operating authority.
+        - Result is stored in call state for X-Call-Id.
+        - Never returns the carrier's phone number.
+        - Fails with `step_out_of_order` if the call already passed OTP under a different MC number.
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyCarrierRequest' }
+      responses:
+        '200':
+          description: Verification result, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyCarrierResponse' }
+              examples:
+                authorized:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, authorized: true, carrier_name: Blue Ridge Transport LLC, authority_status: active, reason: null }
+                notAuthorized:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, authorized: false, carrier_name: null, authority_status: revoked, reason: authority_revoked }
+                blankMcNumber:
+                  value: { ok: false, error_code: invalid_request, error_message: mc_number is required, retryable: false, authorized: null, carrier_name: null, authority_status: null, reason: null }
+                fmcsaDown:
+                  value: { ok: false, error_code: fmcsa_unavailable, error_message: "FMCSA did not respond; try again shortly", retryable: true, authorized: null, carrier_name: null, authority_status: null, reason: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/VerifyCarrierResponse' } } } }
+
+  /otp/send:
+    post:
+      tags: [OTP]
+      summary: Send a one-time code to the phone number on file
+      operationId: sendOtp
+      description: |
+        Maps to agent action `send_otp`.
+
+        **Compliance rules:**
+        - Sends ONLY to the phone number on file for the MC number. There is intentionally
+          NO phone number field in the request.
+        - The code is NEVER returned in any response, log or error.
+        - 6 digits from a secure random generator; only a hash is stored.
+        - Expires after 300 seconds.
+        - Max 2 sends per call (initial + 1 resend). A resend invalidates the previous code.
+        - Requires a successful /carriers/verify on the same X-Call-Id, otherwise fails with `step_out_of_order`.
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McNumberRequest' }
+      responses:
+        '200':
+          description: Send result, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendOtpResponse' }
+              examples:
+                sent:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: sent, masked_phone: '***-***-4821', expires_in_seconds: 300, resends_remaining: 1 }
+                limit:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: resend_limit_reached, masked_phone: null, expires_in_seconds: null, resends_remaining: 0 }
+                notVerifiedYet:
+                  value: { ok: false, error_code: step_out_of_order, error_message: "Carrier not verified for this call; call /carriers/verify first", retryable: false, status: null, masked_phone: null, expires_in_seconds: null, resends_remaining: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/SendOtpResponse' } } } }
+
+  /otp/verify:
+    post:
+      tags: [OTP]
+      summary: Verify the code the carrier read back
+      operationId: verifyOtp
+      description: |
+        Maps to agent action `verify_otp`.
+        - Max 3 attempts per call, then locked (`attempts_exhausted`).
+        - Constant-time comparison against the stored hash.
+        - Only `verified` unlocks load search, booking and handoff for this X-Call-Id.
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyOtpRequest' }
+      responses:
+        '200':
+          description: Verification result, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VerifyOtpResponse' }
+              examples:
+                verified:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: verified, attempts_remaining: 2 }
+                incorrect:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: incorrect, attempts_remaining: 1 }
+                exhausted:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: attempts_exhausted, attempts_remaining: 0 }
+                badFormat:
+                  value: { ok: false, error_code: invalid_request, error_message: code must be exactly 6 digits, retryable: false, status: null, attempts_remaining: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/VerifyOtpResponse' } } } }
+
+  /loads/search:
+    post:
+      tags: [Loads]
+      summary: Search available loads in the legacy TMS
+      operationId: searchLoads
+      description: |
+        Maps to agent action `find_loads`.
+        - Requires OTP verified on this X-Call-Id, otherwise fails with `step_out_of_order`.
+        - Returns at most 3 currently available loads, best match first.
+        - **max_rate MUST NEVER appear in this response.** It is stripped in the service.
+        - TMS calls are retried internally (see x-tms-integration).
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchLoadsRequest' }
+      responses:
+        '200':
+          description: Search result, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchLoadsResponse' }
+              examples:
+                found:
+                  value:
+                    ok: true
+                    error_code: null
+                    error_message: null
+                    retryable: false
+                    status: found
+                    loads:
+                      - { load_id: LD-10482, origin: 'Joliet, IL', destination: 'Dallas, TX', pickup_datetime: '2026-10-08T08:00:00-05:00', delivery_datetime: '2026-10-09T17:00:00-05:00', equipment_type: dry_van, loadboard_rate: 2100, weight: 42000, commodity_type: Paper goods, num_of_pieces: 24, miles: 925, dimensions: 48x40x60, notes: Driver assist not required }
+                noMatch:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: no_match, loads: [] }
+                tmsDown:
+                  value: { ok: false, error_code: tms_unavailable, error_message: TMS did not respond after 3 attempts, retryable: true, status: null, loads: [] }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/SearchLoadsResponse' } } } }
+
+  /offers/evaluate:
+    post:
+      tags: [Negotiation]
+      summary: Decide on a carrier's counter offer
+      operationId: evaluateOffer
+      description: |
+        Maps to agent action `evaluate_offer`.
+
+        **Margin rules:**
+        - Never return max_rate or anything that reveals it (no gap, percent or limit fields).
+        - The service counts rounds itself per X-Call-Id + load_id and ignores a
+          mismatching `round` value. After 3 rounds the decision is always `final_decline`.
+        - counter_rate <= max_rate, counter_rate <= carrier_offer,
+          and counter_rate > the previous counter on this call.
+        - Every accepted or countered amount is saved as an approved rate for this call;
+          /loads/{load_id}/book only accepts the loadboard_rate or an approved rate.
+
+        **Example policy (to be confirmed by Crystal Lane):**
+        - offer <= loadboard_rate -> accept
+        - offer <= max_rate -> accept (optionally counter lower in round 1)
+        - offer > max_rate, rounds 1-2 -> counter at 1/3 then 2/3 of (max_rate - loadboard_rate)
+        - offer > max_rate, round 3 -> final counter at max_rate or final_decline
+        - 4th attempt -> final_decline
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluateOfferRequest' }
+      responses:
+        '200':
+          description: Negotiation decision, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EvaluateOfferResponse' }
+              examples:
+                counter:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, decision: counter, counter_rate: 2200, rounds_remaining: 2 }
+                accept:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, decision: accept, counter_rate: null, rounds_remaining: 1 }
+                decline:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, decision: final_decline, counter_rate: null, rounds_remaining: 0 }
+                loadNotOffered:
+                  value: { ok: false, error_code: step_out_of_order, error_message: "load_id was not offered to this carrier on this call; search loads first", retryable: false, decision: null, counter_rate: null, rounds_remaining: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/EvaluateOfferResponse' } } } }
+
+  /loads/{load_id}/book:
+    post:
+      tags: [Loads]
+      summary: Tentatively book a load in the TMS
+      operationId: bookLoad
+      description: |
+        Maps to agent action `book_load`.
+        - agreed_rate must equal the load's loadboard_rate OR an amount approved by
+          /offers/evaluate on this call; otherwise status `rate_not_approved`.
+        - Requires OTP verified on this X-Call-Id.
+        - Idempotent: the same X-Call-Id + load_id returns the same booking, never a double booking.
+        - A blank load_id (the URL becomes `/loads//book`) still gets this reply shape: HTTP 200,
+          `ok: false`, `error_code: invalid_request`, `error_message: "load_id is required"`.
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+        - name: load_id
+          in: path
+          required: true
+          schema:
+            type: string
+            example: LD-10482
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookLoadRequest' }
+      responses:
+        '200':
+          description: Booking result, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookLoadResponse' }
+              examples:
+                booked:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: booked, booking_reference: BK-77812 }
+                unavailable:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: unavailable, booking_reference: null }
+                notApproved:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: rate_not_approved, booking_reference: null }
+                blankLoadId:
+                  value: { ok: false, error_code: invalid_request, error_message: load_id is required, retryable: false, status: null, booking_reference: null }
+                tmsDown:
+                  value: { ok: false, error_code: tms_unavailable, error_message: TMS did not respond after 3 attempts, retryable: true, status: null, booking_reference: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/BookLoadResponse' } } } }
+
+  /handoff:
+    post:
+      tags: [Handoff]
+      summary: Hand the carrier off to the Senior Rep Queue (mocked for POC)
+      operationId: handoff
+      description: |
+        Maps to agent action `transfer_to_senior_rep`.
+        - Allowed only if /loads/{load_id}/book returned `booked` on this X-Call-Id, otherwise fails with `step_out_of_order`.
+        - POC: records the handoff and returns success (live transfers don't work on web calls).
+      parameters:
+        - $ref: '#/components/parameters/CallId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HandoffRequest' }
+      responses:
+        '200':
+          description: Handoff queued, or a failure with ok=false
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HandoffResponse' }
+              examples:
+                queued:
+                  value: { ok: true, error_code: null, error_message: null, retryable: false, status: queued, queue_position: 1, handoff_id: HO-3391 }
+                notBooked:
+                  value: { ok: false, error_code: step_out_of_order, error_message: "Load is not booked on this call; book it before the handoff", retryable: false, status: null, queue_position: null, handoff_id: null }
+        '401': { description: Missing or wrong API key, content: { application/json: { schema: { $ref: '#/components/schemas/HandoffResponse' } } } }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Shared secret from env var API_KEY. Compared in constant time. Rotatable.
+
+  parameters:
+    CallId:
+      name: X-Call-Id
+      in: header
+      required: true
+      description: |
+        HappyRobot run ID, sent automatically by the workflow. Groups all requests of one
+        call so the service can enforce step order, OTP attempts and negotiation rounds.
+        Call state expires after 1 hour.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+        example: 01a11d81-0000-7000-8000-000000000001
+
+  schemas:
+    # --- envelope fields, present on every response ---
+    Ok:
+      type: boolean
+      description: true when the request was processed; false when it failed (error_code is then set)
+      example: true
+    ErrorCode:
+      type: [string, 'null']
+      description: |
+        null when ok. Otherwise:
+        invalid_request (fix the input), unauthorized (wrong API key), step_out_of_order (do the
+        previous step first), rate_limited, tms_unavailable, tms_malformed_response,
+        fmcsa_unavailable, sms_unavailable, internal_error.
+      enum:
+        - null
+        - invalid_request
+        - unauthorized
+        - step_out_of_order
+        - rate_limited
+        - tms_unavailable
+        - tms_malformed_response
+        - fmcsa_unavailable
+        - sms_unavailable
+        - internal_error
+    ErrorMessage:
+      type: [string, 'null']
+      description: null when ok; otherwise what went wrong, phrased so the agent can act on it
+      example: null
+    Retryable:
+      type: boolean
+      description: true when the same request may succeed if retried (always false when ok)
+      example: false
+
+    # --- shared value types ---
+    McNumber:
+      type: string
+      pattern: '^[0-9]{1,8}$'
+      description: MC number, digits only
+      example: '123456'
+
+    Money:
+      type: number
+      minimum: 0
+      description: Amount in US dollars, no symbols
+      example: 2250
+
+    EquipmentType:
+      type: string
+      enum: [dry_van, reefer, flatbed]
+
+    # --- requests ---
+    McNumberRequest:
+      type: object
+      required: [mc_number]
+      additionalProperties: false
+      properties:
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+
+    VerifyCarrierRequest:
+      $ref: '#/components/schemas/McNumberRequest'
+
+    VerifyOtpRequest:
+      type: object
+      required: [mc_number, code]
+      additionalProperties: false
+      properties:
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+          example: '482913'
+
+    SearchLoadsRequest:
+      type: object
+      required: [mc_number, origin, equipment_type]
+      additionalProperties: false
+      properties:
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+        origin: { type: string, example: 'Joliet, IL' }
+        destination: { type: [string, 'null'], example: 'Dallas, TX', description: 'Optional. An empty string or null means no preference' }
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+        pickup_date: { type: [string, 'null'], format: date, example: '2026-10-08', description: 'Optional YYYY-MM-DD. An empty string or null means any date' }
+
+    EvaluateOfferRequest:
+      type: object
+      required: [load_id, mc_number, carrier_offer, round]
+      additionalProperties: false
+      properties:
+        load_id: { type: string, example: LD-10482 }
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+        carrier_offer: { $ref: '#/components/schemas/Money' }
+        round:
+          type: integer
+          minimum: 1
+          description: Informational. The service counts rounds itself and ignores a mismatching value.
+
+    BookLoadRequest:
+      type: object
+      required: [mc_number, agreed_rate]
+      additionalProperties: false
+      properties:
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+        agreed_rate: { $ref: '#/components/schemas/Money' }
+
+    HandoffRequest:
+      type: object
+      required: [load_id, mc_number, agreed_rate]
+      additionalProperties: false
+      properties:
+        load_id: { type: string, example: LD-10482 }
+        mc_number: { $ref: '#/components/schemas/McNumber' }
+        agreed_rate: { $ref: '#/components/schemas/Money' }
+
+    # --- responses: every key is always present; business fields are null when ok is false ---
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, tms, fmcsa, version]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [ok, degraded, null] }
+        tms: { type: [string, 'null'], enum: [reachable, unreachable, null] }
+        fmcsa: { type: [string, 'null'], enum: [reachable, unreachable, null] }
+        version: { type: [string, 'null'], example: 1.2.1 }
+
+    VerifyCarrierResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, authorized, carrier_name, authority_status, reason]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        authorized: { type: [boolean, 'null'], description: 'true only for active authority; null when ok is false' }
+        carrier_name: { type: [string, 'null'], example: Blue Ridge Transport LLC }
+        authority_status: { type: [string, 'null'], enum: [active, inactive, revoked, not_found, null] }
+        reason: { type: [string, 'null'], enum: [authority_inactive, authority_revoked, carrier_not_found, null] }
+
+    SendOtpResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, masked_phone, expires_in_seconds, resends_remaining]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [sent, resend_limit_reached, no_phone_on_file, not_authorized, null] }
+        masked_phone: { type: [string, 'null'], example: '***-***-4821' }
+        expires_in_seconds: { type: [integer, 'null'], example: 300 }
+        resends_remaining: { type: [integer, 'null'], minimum: 0, maximum: 1 }
+
+    VerifyOtpResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, attempts_remaining]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [verified, incorrect, expired, attempts_exhausted, not_sent, null] }
+        attempts_remaining: { type: [integer, 'null'], minimum: 0, maximum: 3 }
+
+    Load:
+      type: object
+      description: A load as shown to the carrier. max_rate is intentionally NOT part of this schema.
+      required: [load_id, origin, destination, pickup_datetime, delivery_datetime, equipment_type, loadboard_rate]
+      additionalProperties: false
+      properties:
+        load_id: { type: string, example: LD-10482 }
+        origin: { type: string, example: 'Joliet, IL' }
+        destination: { type: [string, 'null'], example: 'Dallas, TX', description: 'Optional. An empty string or null means no preference' }
+        pickup_datetime: { type: string, format: date-time, example: '2026-10-08T08:00:00-05:00' }
+        delivery_datetime: { type: string, format: date-time, example: '2026-10-09T17:00:00-05:00' }
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+        loadboard_rate: { $ref: '#/components/schemas/Money' }
+        weight: { type: number, description: Pounds, example: 42000 }
+        commodity_type: { type: string, example: Paper goods }
+        num_of_pieces: { type: integer, example: 24 }
+        miles: { type: number, example: 925 }
+        dimensions: { type: string, example: 48x40x60 }
+        notes: { type: string, example: Driver assist not required }
+
+    SearchLoadsResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, loads]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [found, no_match, null] }
+        loads:
+          type: array
+          maxItems: 3
+          description: Best match first. Empty on no_match and when ok is false.
+          items: { $ref: '#/components/schemas/Load' }
+
+    EvaluateOfferResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, decision, counter_rate, rounds_remaining]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        decision: { type: [string, 'null'], enum: [accept, counter, final_decline, null] }
+        counter_rate: { type: [number, 'null'], minimum: 0, description: 'US dollars; set only when decision is counter' }
+        rounds_remaining: { type: [integer, 'null'], minimum: 0, maximum: 2 }
+
+    BookLoadResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, booking_reference]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [booked, unavailable, rate_not_approved, null] }
+        booking_reference: { type: [string, 'null'], example: BK-77812 }
+
+    HandoffResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, error_code, error_message, retryable, status, queue_position, handoff_id]
+      properties:
+        ok: { $ref: '#/components/schemas/Ok' }
+        error_code: { $ref: '#/components/schemas/ErrorCode' }
+        error_message: { $ref: '#/components/schemas/ErrorMessage' }
+        retryable: { $ref: '#/components/schemas/Retryable' }
+        status: { type: [string, 'null'], enum: [queued, null] }
+        queue_position: { type: [integer, 'null'], example: 1 }
+        handoff_id: { type: [string, 'null'], example: HO-3391 }
+
+x-tms-integration:
+  description: Rules for the legacy TCP TMS client inside the service
+  timeout_per_attempt_seconds: 1.5
+  max_attempts: 3
+  backoff_seconds: [0.2, 0.5]
+  total_budget_seconds: 4
+  malformed_records: Validate each fixed-width field; skip bad records; if the whole response is bad, retry, then fail with tms_malformed_response
+  connections: Fresh connection per request or a health-checked pool; close sockets cleanly
+  credentials: TMS_HOST, TMS_PORT, TMS_TOKEN from environment variables only
+
+x-security:
+  transport: HTTPS only
+  rate_limit: 60 requests per minute per X-Call-Id (fails with rate_limited and a Retry-After header)
+  call_state_ttl_seconds: 3600
+  never_return_or_log: [max_rate, otp_code, full_phone_number, api_key, tms_token]
+
+x-demo-mode:
+  description: Enabled only when ENV != production
+  env_vars:
+    DEMO_CARRIERS: 'MC:phone pairs, e.g. 123456:+15551234567,654321:+15559876543'
+    TMS_FAULT_RATE: 'Probability 0-1 of simulated TMS failure, e.g. 0.3'
+    DEMO_CONSOLE_KEY: 'Key for the /demo console (simulated handset + call timeline); must differ from API_KEY'
+    QA_TEST_CARRIERS: 'QA automation: MC:code pairs whose OTP code is fixed; every other OTP rule still applies'
+
+x-deployment:
+  container: Dockerfile + docker-compose.yml
+  local: docker compose up -d
+  cloud: Azure Container Apps via scripts/deploy-azure.ps1 (az containerapp)
+  env_vars: [ENV, API_KEY, TMS_HOST, TMS_PORT, TMS_TOKEN, FMCSA_KEY, SMS_PROVIDER_KEY, DEMO_CARRIERS, TMS_FAULT_RATE, DEMO_CONSOLE_KEY, QA_TEST_CARRIERS]
+
+x-happyrobot-mapping:
+  verify_carrier: POST /v1/carriers/verify
+  send_otp: POST /v1/otp/send
+  verify_otp: POST /v1/otp/verify
+  find_loads: POST /v1/loads/search
+  evaluate_offer: POST /v1/offers/evaluate
+  book_load: POST /v1/loads/{load_id}/book
+  transfer_to_senior_rep: POST /v1/handoff

@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Submission prep (email draft, video script) stays local
+delivery/
+# Superseded 16:9 report
+docs/Crystal-Lane-Freight-POC-Report.pdf
+docs/report/crystal-lane-poc-report.html

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLF Demo Console</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #e3e6ec; --text: #1c2230; --muted: #687085;
+    --ok: #1a7f4b; --ok-bg: #e6f4ec; --warn: #9a5b00; --warn-bg: #fdf1dc; --bad: #b42318; --bad-bg: #fde8e6;
+    --info: #1d4ed8; --info-bg: #e7eefe; --bubble: #e9ecf2; --accent: #0f766e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f131a; --panel: #171c25; --line: #262d3a; --text: #e6e9ef; --muted: #98a1b3;
+      --ok: #4ade80; --ok-bg: #12301f; --warn: #fbbf24; --warn-bg: #33270d; --bad: #f87171; --bad-bg: #3a1614;
+      --info: #93b4ff; --info-bg: #17223d; --bubble: #232a37; --accent: #2dd4bf;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input { font: inherit; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 20px; padding: 20px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+  h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+  .sub { margin: 0 0 14px; color: var(--muted); font-size: 12.5px; }
+  .phone { border: 1px solid var(--line); border-radius: 22px; padding: 14px 12px; min-height: 320px; background: var(--bg); }
+  .bubble { background: var(--bubble); border-radius: 14px 14px 14px 4px; padding: 10px 12px; margin-bottom: 10px; }
+  .bubble time { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 4px; }
+  .code { font: 600 20px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 2px; color: var(--accent); }
+  .empty { color: var(--muted); text-align: center; padding: 40px 10px; }
+  .call { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+  .call-head { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; margin-bottom: 8px; }
+  .call-head strong { font-size: 14px; }
+  .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: 70px 170px 1fr; gap: 8px; padding: 5px 0; border-top: 1px dashed var(--line); align-items: baseline; }
+  @media (max-width: 560px) { li { grid-template-columns: 1fr; gap: 2px; } }
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--info-bg); color: var(--info); }
+  .chip.ok { background: var(--ok-bg); color: var(--ok); }
+  .chip.warn { background: var(--warn-bg); color: var(--warn); }
+  .chip.bad { background: var(--bad-bg); color: var(--bad); }
+  .status { font-size: 12.5px; color: var(--muted); }
+  .status.err { color: var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Crystal Lane Freight <span>· carrier sales adapter · demo console</span></h1>
+  <div class="controls">
+    <input id="key" type="password" placeholder="Demo console key" autocomplete="off" aria-label="Demo console key">
+    <button id="save">Connect</button>
+    <button id="reset" title="Clear calls, SMS and TMS bookings">Reset demo</button>
+    <span id="status" class="status"></span>
+  </div>
+</header>
+<main>
+  <section>
+    <h2>Carrier phone</h2>
+    <p class="sub">Simulated SMS provider. This is where OTP codes land; they are never returned to HappyRobot or logged.</p>
+    <div class="controls" style="margin-bottom:12px">
+      <label for="mc">MC</label><input id="mc" inputmode="numeric" placeholder="all" size="10">
+    </div>
+    <div id="sms" class="phone"><div class="empty">No messages yet</div></div>
+  </section>
+  <section>
+    <h2>Live calls</h2>
+    <p class="sub">One card per X-Call-Id, newest first. max_rate, OTP codes and phone numbers are never shown.</p>
+    <div id="calls"><div class="empty">Waiting for the first call…</div></div>
+  </section>
+</main>
+<script>
+(() => {
+  const store = {
+    get(k) { try { return sessionStorage.getItem(k) || ""; } catch { return ""; } },
+    set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+  };
+  let key = store.get("clf-demo-key");
+  const $ = (id) => document.getElementById(id);
+  $("key").value = key;
+  $("mc").value = store.get("clf-demo-mc") || "123456";
+
+  const GOOD = new Set(["authorized", "sent", "verified", "found", "accept", "booked", "queued"]);
+  const SOFT = new Set(["counter", "incorrect", "expired", "not_sent", "no_match", "resend_limit_reached", "rate_not_approved"]);
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+  function chip(outcome) {
+    const tone = GOOD.has(outcome) ? "ok" : SOFT.has(outcome) ? "warn" : outcome ? "bad" : "";
+    return el("span", "chip " + tone, outcome);
+  }
+  function clock(iso) {
+    try { return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }); }
+    catch { return iso; }
+  }
+  function setStatus(text, isError) { $("status").textContent = text; $("status").className = "status" + (isError ? " err" : ""); }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, { ...options, headers: { "X-Demo-Key": key } });
+    if (response.status === 401) throw new Error("Wrong demo console key");
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return response.json();
+  }
+
+  function renderSms(messages) {
+    const box = $("sms");
+    box.replaceChildren();
+    if (!messages.length) { box.append(el("div", "empty", "No messages yet")); return; }
+    for (const m of messages) {
+      const bubble = el("div", "bubble");
+      const call = m.call_id ? ` · call ${m.call_id.slice(0, 8)}` : "";
+      bubble.append(el("time", null, `${clock(m.sent_at)} · to ${m.to} · MC ${m.mc_number}${call}`));
+      const body = el("div");
+      for (const part of m.body.split(/(\b\d{6}\b)/)) {
+        body.append(/^\d{6}$/.test(part) ? el("span", "code", part) : document.createTextNode(part));
+      }
+      bubble.append(body);
+      box.append(bubble);
+    }
+  }
+
+  function renderCalls(calls) {
+    const box = $("calls");
+    box.replaceChildren();
+    if (!calls.length) { box.append(el("div", "empty", "Waiting for the first call…")); return; }
+    for (const call of calls) {
+      const card = el("div", "call");
+      const head = el("div", "call-head");
+      head.append(el("strong", null, call.carrier_name || (call.mc_number ? "MC " + call.mc_number : "Unidentified caller")));
+      if (call.mc_number) head.append(el("span", "mono", "MC " + call.mc_number));
+      head.append(chip(call.otp_verified ? "verified" : call.authorized ? "authorized" : "unverified"));
+      for (const b of call.bookings) head.append(chip("booked"), el("span", "mono", `${b.load_id} · $${b.rate.toLocaleString()} · ${b.reference}`));
+      head.append(el("span", "mono", call.call_id));
+      card.append(head);
+      const list = el("ol");
+      for (const e of call.events) {
+        const row = el("li");
+        row.append(el("span", "mono", clock(e.at)), el("span", null, e.step));
+        const right = el("span");
+        right.append(chip(e.outcome));
+        if (e.detail) right.append(document.createTextNode(" " + e.detail));
+        row.append(right);
+        list.append(row);
+      }
+      card.append(list);
+      box.append(card);
+    }
+  }
+
+  async function refresh() {
+    if (!key) { setStatus("Enter the demo console key", true); return; }
+    try {
+      const mc = $("mc").value.trim();
+      const [phone, calls] = await Promise.all([
+        api("/demo/api/phone" + (/^\d{1,8}$/.test(mc) ? "?mc=" + mc : "")),
+        api("/demo/api/calls"),
+      ]);
+      renderSms(phone.messages);
+      renderCalls(calls.calls);
+      setStatus("Live · updated " + new Date().toLocaleTimeString(), false);
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  }
+
+  $("save").addEventListener("click", () => { key = $("key").value.trim(); store.set("clf-demo-key", key); refresh(); });
+  $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("save").click(); });
+  $("mc").addEventListener("input", () => { store.set("clf-demo-mc", $("mc").value.trim()); refresh(); });
+  $("reset").addEventListener("click", async () => {
+    if (!confirm("Clear all calls, SMS messages and TMS bookings?")) return;
+    try { const r = await api("/demo/api/reset", { method: "POST" }); setStatus(r.tms_reset ? "Demo reset" : "Reset (TMS did not confirm)", !r.tms_reset); refresh(); }
+    catch (err) { setStatus(err.message, true); }
+  });
+
+  refresh();
+  setInterval(refresh, 2000);
+})();
+</script>
+</body>
+</html>
