@@ -26,7 +26,6 @@ records, idempotent booking) run for real rather than being mocked.
 | HappyRobot workflow | https://platform.happyrobot.ai/fdeelasortz/workflows/wd4xx0nj4szq/editor/uwo0tt6eeeet |
 | Operations dashboard (HappyRobot Apps) | https://slate-fjord-rmz94.custom-apps.happyrobot.ai/ |
 | Adapter API docs (Azure Container Apps) | https://ca-clf-adapter.jollyglacier-d430eeb3.eastus.azurecontainerapps.io/docs |
-| Executive report | [docs/Crystal-Lane-Freight-Executive-Report.pdf](docs/Crystal-Lane-Freight-Executive-Report.pdf) |
 | Agent integration guide | [docs/HAPPYROBOT_INTEGRATION.md](docs/HAPPYROBOT_INTEGRATION.md) |
 
 ## Run it locally

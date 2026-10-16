@@ -7,6 +7,6 @@ __pycache__/
 
 # Submission prep (email draft, video script) stays local
 delivery/
-# Superseded 16:9 report
-docs/Crystal-Lane-Freight-POC-Report.pdf
-docs/report/crystal-lane-poc-report.html
+# The executive report is sent with the submission; the repository holds only the API
+docs/*.pdf
+docs/report/
